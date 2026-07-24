@@ -2,7 +2,8 @@ name: Monitor de vuelos
 
 on:
   schedule:
-    - cron: "7 12,17,23 * * *"
+    # 09:07 y 20:07 de Buenos Aires
+    - cron: "7 12,23 * * *"
   workflow_dispatch:
 
 permissions:
@@ -22,19 +23,19 @@ jobs:
 
       - name: Buscar vuelos
         env:
+          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
           ORIGEN: EZE
           DESTINO: MAD
-          MES: "2026-08"
+          SALIDA_DESDE: "2026-08-23"
+          SALIDA_HASTA: "2026-08-27"
           NOCHES: "4"
+          FECHA_OBJETIVO: "2026-08-25"
           UMBRAL: "1000"
           MONEDA: usd
-          SOLO_DIRECTOS: "false"
-          AVISAR_MINIMO: "true"
-          SERP_MAX_VERIF: "5"
+          RESUMEN_DIARIO: "true"
         run: python buscar_vuelos.py
 
       - name: Guardar estado
