@@ -2,8 +2,6 @@ name: Monitor de vuelos
 
 on:
   schedule:
-    # UTC. Buenos Aires es UTC-3 -> 09:00, 14:00 y 20:00 locales.
-    # Minuto 7 y no 0: al filo de la hora la cola de GitHub esta saturada.
     - cron: "7 12,17,23 * * *"
   workflow_dispatch:
 
@@ -27,6 +25,7 @@ jobs:
           TP_TOKEN: ${{ secrets.TP_TOKEN }}
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          SERP_API_KEY: ${{ secrets.SERP_API_KEY }}
           ORIGEN: EZE
           DESTINO: MAD
           MES: "2026-08"
@@ -35,6 +34,7 @@ jobs:
           MONEDA: usd
           SOLO_DIRECTOS: "false"
           AVISAR_MINIMO: "true"
+          SERP_MAX_VERIF: "5"
         run: python buscar_vuelos.py
 
       - name: Guardar estado
