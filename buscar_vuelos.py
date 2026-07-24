@@ -11,10 +11,17 @@ Fuentes, en orden:
      Plan gratuito: 250 busquedas por mes, se resetea el dia 1.
   2) Travelpayouts (cache de hasta 7 dias). Solo si SerpApi falla o se agota.
 
-Manda dos tipos de mensaje:
-  - ALERTA: cuando alguna combinacion baja del umbral (una vez por precio).
-  - RESUMEN: una vez por dia, las combinaciones ordenadas de mas barata a mas
-    cara, para ver si conviene correr las fechas.
+Mensajes que manda:
+  - ALERTA: cuando una fecha marca un minimo nuevo por debajo del umbral.
+    No repite si el precio rebota y vuelve al mismo valor.
+  - RESUMEN: una vez por dia, las combinaciones ordenadas por precio, con la
+    variacion respecto al minimo previo y la tendencia de la ultima semana.
+  - AVISO DE FALLA: si SerpApi deja de responder y quedamos solo con cache.
+
+Codigos de salida:
+  0 = todo bien (o degradado a cache, pero con datos)
+  1 = ninguna fuente respondio -> GitHub Actions marca la corrida como fallida
+      y manda un mail automatico.
 
 Uso:
     pip install requests python-dotenv
@@ -24,6 +31,7 @@ Uso:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
@@ -49,10 +57,10 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 ORIGEN = os.getenv("ORIGEN", "EZE")
 DESTINO = os.getenv("DESTINO", "MAD")
 
-SALIDA_DESDE = os.getenv("SALIDA_DESDE", "2026-08-23")   # primer dia de salida posible
-SALIDA_HASTA = os.getenv("SALIDA_HASTA", "2026-08-27")   # ultimo dia de salida posible
+SALIDA_DESDE = os.getenv("SALIDA_DESDE", "2026-08-23")
+SALIDA_HASTA = os.getenv("SALIDA_HASTA", "2026-08-27")
 NOCHES = int(os.getenv("NOCHES", "4"))
-FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-08-25")  # se marca en el resumen
+FECHA_OBJETIVO = os.getenv("FECHA_OBJETIVO", "2026-08-25")
 
 UMBRAL = float(os.getenv("UMBRAL", "1000"))
 MONEDA = os.getenv("MONEDA", "usd")
@@ -61,6 +69,7 @@ RESUMEN_DIARIO = os.getenv("RESUMEN_DIARIO", "true").lower() == "true"
 SERP_URL = "https://serpapi.com/search"
 TP_URL = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
 ESTADO = BASE_DIR / "estado.json"
+HISTORIAL = BASE_DIR / "historial.csv"
 PAUSA = 1.0
 
 MESES = ["ene", "feb", "mar", "abr", "may", "jun",
@@ -92,13 +101,82 @@ def cargar_estado() -> dict:
             return json.loads(ESTADO.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             log.warning("estado.json corrupto, arranco de cero")
-    return {"avisados": [], "minimos": {}, "ultimo_resumen": None}
+    return {}
 
 
 def guardar_estado(estado: dict) -> None:
-    estado["avisados"] = estado.get("avisados", [])[-300:]
     estado["ultima_corrida"] = datetime.now().isoformat(timespec="seconds")
     ESTADO.write_text(json.dumps(estado, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Historial en CSV
+# --------------------------------------------------------------------------
+COLUMNAS = ["timestamp", "ida", "vuelta", "precio", "moneda", "fuente"]
+
+
+def anotar_historial(resultados: list[dict]) -> None:
+    nuevo = not HISTORIAL.exists()
+    ahora = datetime.now().isoformat(timespec="seconds")
+    try:
+        with HISTORIAL.open("a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if nuevo:
+                w.writerow(COLUMNAS)
+            for o in resultados:
+                w.writerow([
+                    ahora, o["ida"], o["vuelta"],
+                    f"{o['precio']:.0f}", MONEDA.upper(), o["fuente"],
+                ])
+    except OSError as e:
+        log.error("No pude escribir el historial: %s", e)
+
+
+def minimo_por_dia() -> dict[str, float]:
+    """{fecha_de_observacion: precio mas bajo visto ese dia en toda la ventana}"""
+    if not HISTORIAL.exists():
+        return {}
+    minimos: dict[str, float] = {}
+    try:
+        with HISTORIAL.open(newline="", encoding="utf-8") as f:
+            for fila in csv.DictReader(f):
+                try:
+                    dia = fila["timestamp"][:10]
+                    precio = float(fila["precio"])
+                except (KeyError, ValueError, TypeError):
+                    continue
+                if dia not in minimos or precio < minimos[dia]:
+                    minimos[dia] = precio
+    except OSError as e:
+        log.error("No pude leer el historial: %s", e)
+    return minimos
+
+
+def tendencia(actual: float) -> str:
+    """Compara contra la observacion mas cercana a 7 dias atras."""
+    minimos = minimo_por_dia()
+    if not minimos:
+        return ""
+
+    objetivo = date.today() - timedelta(days=7)
+    candidatos = [d for d in minimos if date.fromisoformat(d) <= objetivo]
+    if not candidatos:
+        candidatos = [d for d in minimos if d != date.today().isoformat()]
+    if not candidatos:
+        return ""
+
+    ref_dia = min(candidatos, key=lambda d: abs((date.fromisoformat(d) - objetivo).days))
+    ref = minimos[ref_dia]
+    dias = (date.today() - date.fromisoformat(ref_dia)).days
+    delta = actual - ref
+
+    if abs(delta) < 1:
+        return f"\n📈 Sin cambios respecto a hace {dias} dia(s)."
+    signo = "bajo" if delta < 0 else "subio"
+    return (
+        f"\n📈 En {dias} dia(s) {signo} <b>{abs(delta):.0f} {MONEDA.upper()}</b> "
+        f"(estaba en {ref:.0f})."
+    )
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +208,7 @@ def precio_serpapi(ida: str, vuelta: str) -> dict | None:
         "arrival_id": DESTINO,
         "outbound_date": ida,
         "return_date": vuelta,
-        "type": "1",              # ida y vuelta
+        "type": "1",
         "currency": MONEDA.upper(),
         "hl": "es",
         "gl": "ar",
@@ -173,7 +251,7 @@ def precio_serpapi(ida: str, vuelta: str) -> dict | None:
 
 
 # --------------------------------------------------------------------------
-# Fuente 2: Travelpayouts (cache) - solo de respaldo
+# Fuente 2: Travelpayouts (cache) - respaldo
 # --------------------------------------------------------------------------
 def precio_travelpayouts(ida: str, vuelta: str) -> dict | None:
     if not TP_TOKEN:
@@ -218,7 +296,6 @@ def precio_travelpayouts(ida: str, vuelta: str) -> dict | None:
 
 
 def consultar(ida: str, vuelta: str) -> dict | None:
-    """En vivo primero; si no se pudo, cae al cache."""
     r = precio_serpapi(ida, vuelta)
     if r:
         return r
@@ -251,25 +328,25 @@ def telegram(texto: str) -> bool:
         return False
 
 
-def bloque_alerta(o: dict) -> str:
+def bloque_alerta(o: dict, previo: float | None) -> str:
     escalas = "directo" if o["escalas"] == 0 else f"{o['escalas']} escala(s)"
     sello = "✅ en vivo" if o["fuente"] == "vivo" else "⚠️ cache, sin confirmar"
     detalle = " · ".join(x for x in [o["aerolinea"], escalas, o["duracion"]] if x)
+    baja = f"  <i>(antes {previo:.0f})</i>" if previo else ""
     return (
         f"✈️ <b>{ORIGEN} → {DESTINO}</b>\n"
-        f"💵 <b>{o['precio']:.0f} {MONEDA.upper()}</b>  {sello}\n"
+        f"💵 <b>{o['precio']:.0f} {MONEDA.upper()}</b>{baja}  {sello}\n"
         f"📅 {dia_mes(o['ida'])} → {dia_mes(o['vuelta'])}\n"
         f"🛫 {detalle}\n"
         f"🔗 {o['link']}"
     )
 
 
-def bloque_resumen(resultados: list[dict], estado: dict) -> str:
+def bloque_resumen(resultados: list[dict], minimos: dict) -> str:
     lineas = [
         f"📊 <b>{ORIGEN} → {DESTINO}</b> · {NOCHES} noches",
-        f"<i>Ordenado de mas barato a mas caro</i>\n",
+        "<i>Ordenado de mas barato a mas caro</i>\n",
     ]
-    minimos = estado.get("minimos", {})
 
     for i, o in enumerate(sorted(resultados, key=lambda x: x["precio"]), 1):
         marca = " 🎯" if o["ida"] == FECHA_OBJETIVO else ""
@@ -300,8 +377,14 @@ def bloque_resumen(resultados: list[dict], estado: dict) -> str:
     elif objetivo:
         lineas.append("\n💡 Tus fechas son las mas baratas de la ventana.")
 
+    lineas.append(tendencia(barato["precio"]))
+
+    degradadas = sum(1 for o in resultados if o["fuente"] == "cache")
+    if degradadas:
+        lineas.append(f"\n⚠️ {degradadas} de {len(resultados)} vienen de cache, sin confirmar.")
+
     lineas.append(f"\n🎯 = tus fechas · umbral: {UMBRAL:.0f} {MONEDA.upper()}")
-    return "\n".join(lineas)
+    return "\n".join(x for x in lineas if x)
 
 
 # --------------------------------------------------------------------------
@@ -309,12 +392,13 @@ def bloque_resumen(resultados: list[dict], estado: dict) -> str:
 # --------------------------------------------------------------------------
 def main() -> int:
     if not SERP_API_KEY and not TP_TOKEN:
-        log.error("No hay ninguna fuente configurada (SERP_API_KEY ni TP_TOKEN)")
+        log.error("No hay ninguna fuente configurada")
         return 1
 
     estado = cargar_estado()
-    avisados = set(estado.get("avisados", []))
-    minimos = estado.setdefault("minimos", {})
+    minimos = estado.setdefault("minimos", {})          # minimo visto por fecha
+    avisado_min = estado.setdefault("avisado_min", {})  # ultimo precio avisado por fecha
+    hoy = date.today().isoformat()
 
     pares = pares_a_monitorear()
     if not pares:
@@ -328,43 +412,66 @@ def main() -> int:
         r = consultar(ida, vuelta)
         if r:
             resultados.append(r)
-            log.info(
-                "%s -> %s : %.0f %s (%s)",
-                ida, vuelta, r["precio"], MONEDA.upper(), r["fuente"],
-            )
+            log.info("%s -> %s : %.0f %s (%s)", ida, vuelta, r["precio"], MONEDA.upper(), r["fuente"])
         time.sleep(PAUSA)
 
+    # --- Falla total: ninguna fuente respondio ---
     if not resultados:
-        log.warning("Ninguna fuente devolvio datos")
-        return 0
+        log.error("Ninguna fuente devolvio datos")
+        if estado.get("aviso_caida") != hoy:
+            if telegram(
+                "❌ <b>El monitor no pudo consultar precios</b>\n\n"
+                "Ni Google Flights ni el respaldo respondieron. "
+                "Revisa las credenciales o la cuota de SerpApi."
+            ):
+                estado["aviso_caida"] = hoy
+        guardar_estado(estado)
+        return 1  # marca la corrida como fallida en GitHub Actions
 
-    # --- Alertas por debajo del umbral ---
+    estado.pop("aviso_caida", None)
+    anotar_historial(resultados)
+
+    # --- Degradado: SerpApi no respondio en ninguna fecha ---
+    solo_cache = all(o["fuente"] == "cache" for o in resultados)
+    if solo_cache and SERP_API_KEY and estado.get("aviso_degradado") != hoy:
+        if telegram(
+            "⚠️ <b>Google Flights no responde</b>\n\n"
+            "El monitor esta funcionando solo con precios de cache, que pueden "
+            "tener hasta 7 dias. Puede ser la cuota mensual de SerpApi agotada "
+            "o la key vencida."
+        ):
+            estado["aviso_degradado"] = hoy
+    elif not solo_cache:
+        estado.pop("aviso_degradado", None)
+
+    # --- Alertas: solo minimos nuevos por debajo del umbral ---
     nuevas = []
     for o in resultados:
-        marca = f"{o['ida']}|{o['precio']:.0f}"
-        if o["precio"] < UMBRAL and marca not in avisados:
-            nuevas.append(o)
-            avisados.add(marca)
+        if o["precio"] >= UMBRAL:
+            continue
+        previo = avisado_min.get(o["ida"])
+        if previo is None or o["precio"] < previo:
+            nuevas.append((o, previo))
+            avisado_min[o["ida"]] = o["precio"]
 
     if nuevas:
         cabecera = f"🚨 <b>{len(nuevas)} tarifa(s) por debajo de {UMBRAL:.0f} {MONEDA.upper()}</b>\n"
-        telegram(cabecera + "\n" + "\n\n".join(bloque_alerta(o) for o in nuevas))
-        log.info("Avise %d oferta(s)", len(nuevas))
+        cuerpo = "\n\n".join(bloque_alerta(o, prev) for o, prev in nuevas)
+        if telegram(cabecera + "\n" + cuerpo):
+            log.info("Avise %d minimo(s) nuevo(s)", len(nuevas))
 
-    # --- Resumen diario (una vez por dia) ---
-    hoy = date.today().isoformat()
+    # --- Resumen diario ---
     if RESUMEN_DIARIO and estado.get("ultimo_resumen") != hoy:
-        if telegram(bloque_resumen(resultados, estado)):
+        if telegram(bloque_resumen(resultados, minimos)):
             estado["ultimo_resumen"] = hoy
             log.info("Resumen diario enviado")
 
-    # --- Guardar minimos por fecha de salida ---
+    # --- Actualizar minimos ---
     for o in resultados:
         previo = minimos.get(o["ida"])
         if previo is None or o["precio"] < previo:
             minimos[o["ida"]] = o["precio"]
 
-    estado["avisados"] = sorted(avisados)
     guardar_estado(estado)
     return 0
 
